@@ -1,14 +1,10 @@
 import { db } from "@/lib/db"
 import OpenAI from "openai"
-
 import { z } from "zod"
 import { getUserSubscriptionPlan } from "@/lib/subscription";
-import { AssistantResponse } from '@/lib/assistant-response';
 import { zfd } from "zod-form-data";
-import { Message } from "openai/resources/beta/threads/messages.mjs";
 import { fileTypesFullList } from "@/lib/validations/codeInterpreter";
 import { fileTypes as searchFile } from "@/lib/validations/fileSearch";
-import { File } from "buffer";
 import { getClientIP } from "@/lib/getIP";
 
 export const maxDuration = 300;
@@ -47,6 +43,8 @@ export async function POST(
                 chatbotErrorMessage: true,
                 maxCompletionTokens: true,
                 maxPromptTokens: true,
+                prompt: true,
+                name: true,
             },
             where: {
                 id: params.chatbotId,
@@ -62,61 +60,53 @@ export async function POST(
         })
 
         const input = await req.formData();
-
         const data = schema.parse(input);
 
-        // Create a thread if needed
-        const threadId = data.threadId != '' ? data.threadId : (await openai.beta.threads.create({
+        const messages = [
+            {
+                role: "system" as const,
+                content: chatbot.prompt || "You are a helpful assistant."
+            },
+            {
+                role: "user" as const,
+                content: data.message.toString()
+            }
+        ];
 
-        })).id
+        let tools: any[] = [];
+        let fileAttachments: any[] = [];
 
-        let openAiFile: OpenAI.Files.FileObject | null = null;
-
-        if (data.filename !== '') {
+        if (data.filename !== '' && data.file instanceof Blob && data.file.size > 0) {
             const file = new File([data.file], data.filename, { type: data.file.type });
+            
+            const openAiFile = await openai.files.create({
+                file,
+                purpose: "assistants"
+            });
 
-            if (data.file.size > 0) {
-                openAiFile = await openai.files.create({
-                    file,
-                    purpose: "assistants"
+            const fileExtension = data.filename.split('.').pop()?.toLowerCase();
+            
+            if (fileTypesFullList.includes(fileExtension!)) {
+                tools.push({ type: "code_interpreter" });
+            }
+            if (searchFile.includes(fileExtension!)) {
+                tools.push({ type: "file_search" });
+                fileAttachments.push({
+                    file_id: openAiFile.id,
+                    tools: [{ type: "file_search" }]
                 });
             }
         }
 
-        let fileInterpreter = false;
-        let fileSearch = false;
-        if (openAiFile) {
-            if (fileTypesFullList.includes(data.filename.split('.').pop()?.toLocaleLowerCase()!)) {
-                fileInterpreter = true;
-            }
-            if (searchFile.includes(data.filename.split('.').pop()!)) {
-                fileSearch = true;
-            }
+        if (!tools.some(t => t.type === "file_search")) {
+            tools.push({ type: "file_search" });
+        }
+        if (!tools.some(t => t.type === "code_interpreter")) {
+            tools.push({ type: "code_interpreter" });
         }
 
-        const toolList = [
-            fileInterpreter ? { type: "code_interpreter" } : null,
-            fileSearch ? { type: "file_search" } : null
-        ].filter(Boolean)
-
-        // Add a message to the thread
-        const createdMessage = await openai.beta.threads.messages.create(threadId!, {
-            role: 'user' as 'user' | 'assistant',
-            content: data.message.toString(),
-            attachments: openAiFile ? [
-                {
-                    file_id: openAiFile.id,
-                    tools: toolList
-                }
-            ] : []
-        });
-
-
-
-        return AssistantResponse(
-            { threadId, messageId: createdMessage.id, chatbotId: params.chatbotId },
-            async ({ sendMessage, forwardStream, sendDataMessage }) => {
-
+        const stream = new ReadableStream({
+            async start(controller) {
                 try {
                     const plan = await getUserSubscriptionPlan(chatbot.userId)
                     if (plan.unlimitedMessages === false) {
@@ -128,97 +118,71 @@ export async function POST(
                                 }
                             }
                         })
-                        console.log(`Message count: ${messageCount}`)
+                        
                         if (messageCount >= plan.maxMessagesPerMonth!) {
-                            console.log(`Reached message limit ${chatbot.userId}`)
-                            sendMessage({
-                                id: "end",
-                                role: 'assistant',
-                                content: [{ type: 'text', text: { value: "You have reached your monthly message limit. Upgrade your plan to continue using your chatbot." } }]
+                            const errorData = JSON.stringify({
+                                event: "error",
+                                data: { message: "You have reached your monthly message limit. Upgrade your plan to continue using your chatbot." }
                             });
+                            controller.enqueue(`data: ${errorData}\n\n`);
+                            controller.close();
                             return;
                         }
                     }
 
-                    // Run the assistant on the thread
-                    const runStream = openai.beta.threads.runs.stream(threadId!, {
-                        assistant_id: chatbot.openaiId,
-                        instructions: (data.clientSidePrompt || "").replace('+', '') || "",
-                        max_completion_tokens: chatbot.maxCompletionTokens,
-                        max_prompt_tokens: chatbot.maxPromptTokens,
+                    const events = await openai.responses.create({
+                        model: "gpt-4o",
+                        input: messages,
+                        tools,
+                        stream: true,
+                        parallel_tool_calls: false,
                     });
 
-                    let runResult = await forwardStream(runStream);
+                    let assistantResponse = "";
 
-                    // validate if there is any error
-                    if (runResult == undefined) {
-                        console.log(`Error running assistant ${chatbot.openaiId} on thread ${threadId}`)
-
-                        // set the error if last_error is not null
-                        let errorMessage = 'Unknown error'
-                        if (runStream.currentEvent()?.data.last_error) {
-                            errorMessage = runStream.currentEvent()?.data.last_error.message
-                        }
-
-                        await db.chatbotErrors.create({
-                            data: {
-                                errorMessage: errorMessage,
-                                threadId: threadId || '',
-                                chatbotId: chatbot.id,
-                            }
-                        })
-
-                        sendMessage({
-                            id: "end",
-                            role: 'assistant',
-                            content: [{
-                                type: 'text', text: { value: chatbot.chatbotErrorMessage }
-                            }]
+                    for await (const event of events) {
+                        const eventData = JSON.stringify({
+                            event: event.type,
+                            data: event,
                         });
-                        return;
-                    }
+                        controller.enqueue(`data: ${eventData}\n\n`);
 
-                    // Get new thread messages (after our message)
-                    const responseMessages: Message[] = (
-                        await openai.beta.threads.messages.list(threadId, {
-                            after: createdMessage.id,
-                            order: 'asc',
-                        })
-                    ).data;
-
-                    for (const message of responseMessages) {
-                        let response = ''
-                        if (message.content[0].type == 'text') {
-                            response = message.content[0].text.value
-                        } else if (message.content[0].type == 'image_file') {
-                            response = message.content[0].image_file.file_id
-                        } else if (message.content[0].type == 'image_url') {
-                            response = message.content[0].image_url.url
+                        if (event.type === "response.output_text.delta") {
+                            assistantResponse += event.delta || "";
                         }
-
-                        await db.message.create({
-                            data: {
-                                chatbotId: params.chatbotId,
-                                userId: chatbot.userId,
-                                message: data.message,
-                                threadId: threadId,
-                                response: response,
-                                userIP: getClientIP(),
-                                from: req.headers.get("origin") || "unknown",
-                            }
-                        })
-
                     }
-                } catch (error) {
-                    console.error(error)
-                    sendMessage({
-                        id: "end",
-                        role: 'assistant',
-                        content: [{ type: 'text', text: { value: chatbot.chatbotErrorMessage } }]
+
+                    await db.message.create({
+                        data: {
+                            chatbotId: params.chatbotId,
+                            userId: chatbot.userId,
+                            message: data.message,
+                            threadId: data.threadId || "",
+                            response: assistantResponse,
+                            userIP: getClientIP(),
+                            from: req.headers.get("origin") || "unknown",
+                        }
                     });
+
+                    controller.close();
+                } catch (error) {
+                    console.error(error);
+                    const errorData = JSON.stringify({
+                        event: "error",
+                        data: { message: chatbot.chatbotErrorMessage }
+                    });
+                    controller.enqueue(`data: ${errorData}\n\n`);
+                    controller.close();
                 }
             },
-        );
+        });
+
+        return new Response(stream, {
+            headers: {
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+            },
+        });
 
     } catch (error) {
         console.error(error)

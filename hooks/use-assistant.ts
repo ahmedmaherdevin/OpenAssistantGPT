@@ -145,83 +145,79 @@ export function useAssistant({
         throw new Error('The response body is empty.');
       }
 
-      for await (const { type, value } of readDataStream(
-        result.body.getReader(),
-      )) {
-        switch (type) {
-          case 'assistant_message': {
-            setMessages(messages => [
-              ...messages,
-              {
-                id: value.id,
-                role: value.role,
-                content: value.content[0].text.value,
-              },
-            ]);
-            break;
-          }
-
-          case 'message_annotations': {
-            for (const annotation of value) {
-              if (annotation.type !== 'file_path') {
-                continue;
+      const reader = result.body.getReader();
+      const decoder = new TextDecoder();
+      
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        
+        const chunk = decoder.decode(value);
+        const lines = chunk.split('\n');
+        
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            try {
+              const eventData = JSON.parse(line.slice(6));
+              
+              switch (eventData.event) {
+                case 'response.output_text.delta': {
+                  setMessages(messages => {
+                    const lastMessage = messages[messages.length - 1];
+                    if (lastMessage && lastMessage.role === 'assistant') {
+                      return [
+                        ...messages.slice(0, messages.length - 1),
+                        {
+                          ...lastMessage,
+                          content: lastMessage.content + (eventData.data.delta || ''),
+                        },
+                      ];
+                    } else {
+                      return [
+                        ...messages,
+                        {
+                          id: generateId(),
+                          role: 'assistant',
+                          content: eventData.data.delta || '',
+                        },
+                      ];
+                    }
+                  });
+                  break;
+                }
+                
+                case 'response.output_text.annotation.added': {
+                  const annotation = eventData.data.annotation;
+                  if (annotation && annotation.type === 'file_path') {
+                    setMessages(messages => {
+                      const lastMessage = messages[messages.length - 1];
+                      if (lastMessage && lastMessage.role === 'assistant') {
+                        const updatedContent = lastMessage.content.replace(
+                          annotation.text,
+                          `/api/chatbots/${id}/chat/file/${annotation.file_path.file_id}`
+                        );
+                        return [
+                          ...messages.slice(0, messages.length - 1),
+                          {
+                            ...lastMessage,
+                            content: updatedContent,
+                          },
+                        ];
+                      }
+                      return messages;
+                    });
+                  }
+                  break;
+                }
+                
+                case 'error': {
+                  setError(new Error(eventData.data.message));
+                  break;
+                }
               }
-              setMessages(messages => {
-                const lastMessage = messages[messages.length - 1];
-                lastMessage.content = lastMessage.content.replace(
-                  annotation.text,
-                  annotation.file_path.url,
-                );
-                return [...messages.slice(0, messages.length - 1), lastMessage];
-              });
+            } catch (parseError) {
+              console.error('Error parsing SSE data:', parseError);
             }
-            break;
-          }
-
-          case 'text': {
-            setMessages(messages => {
-              const lastMessage = messages[messages.length - 1];
-              return [
-                ...messages.slice(0, messages.length - 1),
-                {
-                  id: lastMessage.id,
-                  role: lastMessage.role,
-                  content: lastMessage.content + value,
-                },
-              ];
-            });
-
-            break;
-          }
-
-          case 'data_message': {
-            setMessages(messages => [
-              ...messages,
-              {
-                id: value.id ?? generateId(),
-                role: 'data',
-                content: '',
-                data: value.data,
-              },
-            ]);
-            break;
-          }
-
-          case 'assistant_control_data': {
-            setCurrentThreadId(value.threadId);
-
-            setMessages(messages => {
-              const lastMessage = messages[messages.length - 1];
-              lastMessage.id = value.messageId;
-              return [...messages.slice(0, messages.length - 1), lastMessage];
-            });
-
-            break;
-          }
-
-          case 'error': {
-            setError(new Error(value));
-            break;
           }
         }
       }

@@ -213,18 +213,6 @@ export async function PATCH(
       };
     }
 
-    await openai.beta.assistants.update(
-      chatbot.openaiId,
-      {
-        name: chatbot.name,
-        instructions: chatbot.prompt,
-        model: model?.name,
-        tools: [{ type: "file_search" }, { type: "code_interpreter" }],
-        tool_resources: {
-          ...bodyTools
-        },
-      }
-    )
 
     return new Response(JSON.stringify(chatbot))
   } catch (error) {
@@ -279,7 +267,6 @@ export async function DELETE(
           apiKey: openAIConfig?.globalAPIKey
         })
 
-        await openai.beta.assistants.del(chatbot?.openaiId || '')
       } catch (error) {
         console.log(error)
       }

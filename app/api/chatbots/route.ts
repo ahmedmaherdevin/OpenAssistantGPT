@@ -155,22 +155,12 @@ export async function POST(req: Request) {
       };
     }
 
-    const createdChatbot = await openai.beta.assistants.create({
-      name: body.name,
-      instructions: body.prompt,
-      model: model.name,
-      tools: [{ type: "file_search" }, { type: "code_interpreter" }],
-      tool_resources: {
-        ...bodyTools
-      }
-    })
-
     const chatbot = await db.chatbot.create({
       data: {
         name: body.name,
         prompt: body.prompt,
         openaiKey: body.openAIKey,
-        openaiId: createdChatbot.id,
+        openaiId: `local_${Date.now()}`, // Generate a local ID for compatibility
         modelId: model.id,
         userId: user?.id,
         welcomeMessage: body.welcomeMessage,
