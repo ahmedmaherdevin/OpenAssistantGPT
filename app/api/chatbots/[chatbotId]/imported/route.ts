@@ -134,7 +134,6 @@ export async function DELETE(
       apiKey: openAIConfig?.globalAPIKey
     })
 
-    await openai.beta.assistants.del(chatbot?.openaiId || '')
 
     await db.chatbot.delete({
       where: {

@@ -61,7 +61,7 @@ export async function POST(req: Request) {
             const openaiClient = new OpenAI({
                 apiKey: body.openAIKey
             })
-            await openaiClient.beta.assistants.retrieve(body.openAIAssistantId)
+            await openaiClient.models.list()
         } catch (error) {
             return new Response("Invalid OpenAI Assistant ID", { status: 400, statusText: "Invalid OpenAI Assistant ID" })
         }
